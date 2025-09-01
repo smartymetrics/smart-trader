@@ -1,0 +1,5 @@
+*.env
+smart-trader/
+*.env.example
+notebooks/.env
+.vercel

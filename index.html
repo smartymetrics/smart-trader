@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Solana Trader Dashboard</title>
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Recharts -->
+    <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #f8f9fa;
+        margin: 0;
+        padding: 20px;
+      }
+      h2 {
+        text-align: center;
+      }
+      .dashboard {
+        max-width: 900px;
+        margin: auto;
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const {
+        LineChart,
+        Line,
+        XAxis,
+        YAxis,
+        Tooltip,
+        CartesianGrid,
+        Legend,
+        ResponsiveContainer
+      } = Recharts;
+
+      function SolanaTraderDashboard() {
+        const data = [
+          { date: "2025-08-20", traders: 120, trades: 300 },
+          { date: "2025-08-21", traders: 180, trades: 450 },
+          { date: "2025-08-22", traders: 150, trades: 400 },
+          { date: "2025-08-23", traders: 220, trades: 500 },
+          { date: "2025-08-24", traders: 200, trades: 470 }
+        ];
+
+        return (
+          <div className="dashboard">
+            <h2>📊 Solana Trader Dashboard</h2>
+            <ResponsiveContainer width="100%" height={400}>
+              <LineChart data={data}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="traders" stroke="#8884d8" />
+                <Line type="monotone" dataKey="trades" stroke="#82ca9d" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(<SolanaTraderDashboard />);
+    </script>
+  </body>
+</html>
