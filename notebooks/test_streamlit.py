@@ -197,7 +197,7 @@ def main():
     
     # === Wallet Input Section (for wallet analysis) ===
     wallet_addresses = []
-    if analysis_type in ["Trader Portfolio Analysis", "Wallet Analysis"]:
+    if analysis_type in ["Trader Portifolio Analysis", "Wallet Analysis"]:
         st.sidebar.subheader("👛 Wallet Configuration")
         wallet_input = st.sidebar.text_area(
             "Wallet Addresses (one per line)",
@@ -219,7 +219,7 @@ def main():
             st.error("Please enter at least one token address")
             st.stop()
         
-        if analysis_type in ["Trader Portfolio Analysis", "Wallet Analysis"] and not wallet_addresses:
+        if analysis_type in ["Trader Portifolio Analysis", "Wallet Analysis"] and not wallet_addresses:
             st.error("Please enter at least one wallet address for this analysis type")
             st.stop()
         
@@ -234,7 +234,7 @@ def main():
                 elif analysis_type == "Trader Portfolio Analysis":
                     results = run_async(analyze_traders_for_tokens(token_addresses, trade_limit))
                     st.session_state.last_analysis_data = results
-                    display_trader_portfolio_analysis(results, token_addresses)
+                    display_trader_portfolio_analysis(results)
                 
                 elif analysis_type == "Wallet Analysis":
                     async def wallet_analysis():
@@ -471,7 +471,7 @@ def display_token_trade_analysis(results, token_addresses):
         top_volume['Total Buy Volume'] = top_volume['Total Buy Volume'].apply(format_usd)
         st.dataframe(top_volume, hide_index=True, use_container_width=True)
 
-def display_trader_portfolio_analysis(results, token_addresses):
+def display_trader_portfolio_analysis(results):
     """Display trader portfolio analysis results"""
     st.header("👤 Trader Portfolio Analysis")
     
