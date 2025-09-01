@@ -12,6 +12,7 @@ import joblib
 from dotenv import load_dotenv
 from aiolimiter import AsyncLimiter
 import math
+import json
 
 logger = logging.getLogger("refactor-smart-trader")
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +25,7 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 
 HELIUS_TX_URL = "https://api.helius.xyz/v0/addresses/{address}/transactions"
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-HELIUS_TRADES_URL = f"https://mainnet.helius.xyz/v1/{HELIUS_API_KEY}/transactions"
+
 BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price"
 # BIRDEYE_MULTI_PRICE_URL = "https://public-api.birdeye.so/defi/multi_price"
 BIRDEYE_HISTORICAL_PRICE_URL = "https://public-api.birdeye.so/defi/historical_price_unix"
@@ -209,18 +210,20 @@ def save_price_cache(cache: Dict[str, Any]) -> None:
 async def get_token_trades_by_address(
     client: HttpClient,
     address: str,
-    transaction_type: str = "SWAP",
     page_size: int = 100,
     cached_signatures: Optional[Set[str]] = None,
     max_pages: Optional[int] = None
 ) -> List[dict]:
-    # Validate address first
+    """
+    Fetch enriched transactions for a given address (token mint).
+    Paginates and deduplicates using cached signatures.
+    """
     if not is_valid_solana_address(address):
         logger.error(f"Invalid Solana address format: {address}")
         return []
-    
+
     cached_signatures = cached_signatures or set()
-    all_trades: List[dict] = []
+    all_txs: List[dict] = []
     before_sig: Optional[str] = None
     pages = 0
 
@@ -228,7 +231,6 @@ async def get_token_trades_by_address(
         params = {
             "api-key": HELIUS_API_KEY,
             "limit": page_size,
-            "type": transaction_type,
             "commitment": "finalized"
         }
         if before_sig:
@@ -254,14 +256,14 @@ async def get_token_trades_by_address(
         if not new_batch:
             break
 
-        all_trades.extend(new_batch)
+        all_txs.extend(new_batch)
         before_sig = res[-1].get("signature")
         pages += 1
         if max_pages and pages >= max_pages:
             break
 
-    logger.info(f"✅ {len(all_trades)} new trades fetched for {address}")
-    return all_trades
+    logger.info(f"✅ {len(all_txs)} new transactions fetched for {address}")
+    return all_txs
 
 # === Price fetching (current + multi + historical) ===
 def _now_utc() -> datetime:
@@ -276,16 +278,22 @@ async def get_token_current_price(client: HttpClient, token_mint: Union[str, Lis
     """
     Fetch the current USD price for a single token or a list of tokens.
     Uses a cache to avoid repeated calls.
-    No batching is used (your tier doesn't allow it).
+    No batching is used (free tier doesn't allow it).
     """
+
     async def fetch_price(mint: str) -> float:
         # If cached, return price
         if mint in PRICE_CACHE:
             return PRICE_CACHE[mint]
 
         url = f"{BIRDEYE_PRICE_URL}?address={mint}"
+        headers = {
+            "accept": "application/json",
+            "x-api-key": BIRDEYE_API_KEY
+        }
+
         try:
-            data = await client.get_json(url, rate_key="birdeye_price")
+            data = await client.get_json(url, headers=headers, rate_key="birdeye_price")
             price = float(data.get("data", {}).get("value", 0.0))
             PRICE_CACHE[mint] = price
             return price
@@ -300,6 +308,28 @@ async def get_token_current_price(client: HttpClient, token_mint: Union[str, Lis
     # If multiple tokens, fetch in parallel
     results = await asyncio.gather(*(fetch_price(m) for m in token_mint))
     return {m: p for m, p in zip(token_mint, results)}
+
+def load_historical_price_cache() -> Dict[str, Any]:
+    """
+    Load historical price cache from file. 
+    Returns empty dict if file doesn't exist or is invalid JSON.
+    """
+    cache_file = "historical_price_cache.json"
+    if not os.path.exists(cache_file):
+        return {}
+    try:
+        with open(cache_file, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"Corrupted historical price cache file. Resetting... ({e})")
+        return {}
+
+
+def save_historical_price_cache(cache: Dict[str, Any]):
+    """Save historical price cache to disk."""
+    cache_file = "historical_price_cache.json"
+    with open(cache_file, "w") as f:
+        json.dump(cache, f)
 
 # Global in-memory cache
 historical_price_cache = {}
@@ -317,15 +347,19 @@ async def get_historical_price(
     global historical_price_cache
     historical_price_cache = load_historical_price_cache()
 
-    headers = {"accept": "application/json", "x-chain": "solana"}
-    if BIRDEYE_API_KEY:
-        headers["X-API-KEY"] = BIRDEYE_API_KEY
+    headers = {
+        "accept": "application/json",
+        "x-chain": "solana",
+        "x-api-key": BIRDEYE_API_KEY   # ✅ must be lowercase
+    }
 
     results = {}
 
     # Helper to get the start of a UTC day
     def day_start(ts):
-        return int(datetime.utcfromtimestamp(ts).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        return int(datetime.utcfromtimestamp(ts).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp())
 
     current = day_start(start_time)
     end_of_range = day_start(end_time)
@@ -356,37 +390,42 @@ async def get_historical_price(
                     rate_key="birdeye_price"
                 )
                 data = res.get("data", [])
-                prices = {int(item["unixTime"]): float(item["value"]) for item in data}
-                
-                # Cache the day's prices
+                if not isinstance(data, list):
+                    logger.error(f"Unexpected historical price response for {mint}: {res}")
+                    continue
+
+                prices = {}
+                for item in data:
+                    if isinstance(item, dict) and "unixTime" in item and "value" in item:
+                        try:
+                            ts = int(item["unixTime"])
+                            val = float(item["value"])
+                            prices[ts] = val
+                        except Exception as e:
+                            logger.warning(f"Bad price record for {mint}: {item} ({e})")
+
                 historical_price_cache[day_key] = prices
                 save_historical_price_cache(historical_price_cache)
-                
                 results.update(prices)
+
             except Exception as e:
-                logger.error(f"Failed to fetch historical price for {mint} on {datetime.utcfromtimestamp(current).date()}: {e}")
+                logger.error(
+                    f"Failed to fetch historical price for {mint} on {datetime.utcfromtimestamp(current).date()}: {e}"
+                )
 
         current += 86400  # Move to next day
 
     return results
 
-def get_price_at_timestamp(historical_prices: Dict[int, float], target_timestamp: int) -> float:
+def get_price_at_timestamp(price_dict: Dict[int, float], timestamp: int) -> float:
     """
-    Get the price closest to a specific timestamp from historical price data.
+    Get the closest price <= timestamp from historical prices.
     """
-    if not historical_prices:
+    if not price_dict:
         return 0.0
-    
-    # Find the closest timestamp
-    closest_timestamp = min(historical_prices.keys(), 
-                             key=lambda ts: abs(ts - target_timestamp))
-    
-    # Only use prices within 1 hour of the target time
-    time_diff = abs(closest_timestamp - target_timestamp)
-    if time_diff <= 3600:  # 1 hour in seconds
-        return historical_prices[closest_timestamp]
-    
-    return 0.0
+    closest_ts = max((ts for ts in price_dict.keys() if ts <= timestamp), default=None)
+    return price_dict.get(closest_ts, 0.0) if closest_ts else 0.0
+
 
 async def get_historical_prices_for_trades(client: HttpClient, trades_df: pd.DataFrame) -> Dict[str, Dict[int, float]]:
     """
@@ -457,13 +496,6 @@ def _parse_token_amount(obj: Any) -> float:
     except Exception:
         return 0.0
 
-import asyncio
-import pandas as pd
-from datetime import datetime
-from typing import List, Dict, Any
-import json
-import os
-
 TRADE_CACHE_FILE = "trade_cache.json"
 
 def load_trade_cache() -> Dict[str, Any]:
@@ -482,103 +514,125 @@ def save_trade_cache(cache: Dict[str, Any]):
         json.dump(cache, f)
 
 async def get_flattened_trades(
-    client: HttpClient, 
-    token_mints: List[str], 
-    limit: int = 100,
-    max_pages: int = 50
+    client: HttpClient,
+    token_mints: List[str],
+    limit: int = 100
 ) -> pd.DataFrame:
     """
-    Fetches ALL trades for given token mints with pagination.
-    Uses cache to only fetch new trades since last run.
+    Fetch flattened swap trades for up to 3 token mints.
+    Uses caching to avoid re-fetching old signatures.
     """
-
     if len(token_mints) > 3:
-        raise ValueError("Maximum of 3 token mint addresses allowed per call.")
+        raise ValueError("Maximum of 3 token mint addresses allowed.")
 
-    trade_cache = load_trade_cache()
-    all_trades = []
+    # Validate
+    valid_mints = [m for m in token_mints if is_valid_solana_address(m)]
+    if len(valid_mints) != len(token_mints):
+        invalid = [m for m in token_mints if not is_valid_solana_address(m)]
+        logger.error(f"Invalid mint addresses provided: {invalid}")
+        if not valid_mints:
+            return pd.DataFrame()
+        logger.info(f"Proceeding with valid mints: {valid_mints}")
 
-    async def fetch_trades_for_mint(mint: str):
-        """Fetch all trades for a single token mint with pagination, using cache."""
-        cached_trades = trade_cache.get(mint, [])
-        last_cached_signatures = {t["signature"] for t in cached_trades}
-        trades = cached_trades.copy()
+    flattened: List[Dict[str, Any]] = []
 
-        before_tx = None
-        page_count = 0
+    # Fetch concurrently
+    tasks = []
+    for mint in valid_mints:
+        cached_df = _load_df_cache(mint)
+        cached_sigs = (
+            set(cached_df["signature"].dropna().unique().tolist())
+            if "signature" in cached_df.columns
+            else set()
+        )
+        tasks.append(get_token_trades_by_address(client, mint, page_size=limit, cached_signatures=cached_sigs))
 
-        while page_count < max_pages:
-            params = {
-                "address": mint,
-                "limit": limit,
-            }
-            if before_tx:
-                params["before_tx"] = before_tx
+    all_txs = await asyncio.gather(*tasks)
+
+    # Flatten
+    for mint, txs in zip(valid_mints, all_txs):
+        cached_df = _load_df_cache(mint)
+        latest_time = cached_df["blocktime"].max() if "blocktime" in cached_df.columns and not cached_df.empty else None
+
+        rows = []
+        for tx in txs:
+            token_transfers = tx.get("tokenTransfers") or []
+            if len(token_transfers) < 2:
+                continue
+
+            sold = token_transfers[0]
+            bought = token_transfers[1]
+            ts = tx.get("timestamp") or tx.get("blockTime") or tx.get("blocktime")
+            if not ts:
+                continue
 
             try:
-                res = await client.get_json(
-                    HELIUS_TRADES_URL,
-                    params=params,
-                    headers={"accept": "application/json"},
-                    rate_key="helius_trades"
-                )
-            except Exception as e:
-                logger.error(f"Error fetching trades for {mint}: {e}")
-                break
+                blocktime = pd.to_datetime(int(ts), unit="s", utc=True)
+            except (ValueError, TypeError):
+                continue
 
-            items = res.get("result", [])
-            if not items:
-                break
+            if latest_time is not None and blocktime <= latest_time:
+                continue
 
-            # Stop if we reach already cached trades
-            new_items = [t for t in items if t["signature"] not in last_cached_signatures]
-            if not new_items:
-                break
+            source_token_mint = sold.get("mint") if sold.get("mint") == mint else bought.get("mint")
+            if not source_token_mint:
+                continue
 
-            trades.extend(new_items)
-            before_tx = items[-1].get("signature")
-            if not before_tx:
-                break
+            sold_amt = _parse_token_amount(sold.get("tokenAmount"))
+            bought_amt = _parse_token_amount(bought.get("tokenAmount"))
 
-            page_count += 1
+            row = {
+                "blocktime": blocktime,
+                "trader_id": sold.get("fromUserAccount") or sold.get("owner") or None,
+                "token_sold_mint": sold.get("mint"),
+                "amount_sold": sold_amt,
+                "token_bought_mint": bought.get("mint"),
+                "amount_bought": bought_amt,
+                "source_token": source_token_mint,
+                "signature": tx.get("signature")
+            }
+            rows.append(row)
 
-        trade_cache[mint] = trades
-        return trades
+        new_df = pd.DataFrame(rows)
+        if not new_df.empty:
+            combined = pd.concat([cached_df, new_df], ignore_index=True)
+            combined = combined.drop_duplicates(subset=["signature"], keep="first")
+            _save_df_cache(mint, combined)
+            flattened.extend(combined.to_dict("records"))
+        else:
+            if not cached_df.empty:
+                flattened.extend(cached_df.to_dict("records"))
 
-    trade_tasks = [fetch_trades_for_mint(m) for m in token_mints]
-    results = await asyncio.gather(*trade_tasks)
+    trades_df = pd.DataFrame(flattened)
+    if trades_df.empty:
+        logger.warning("No swap trades found for given token mints.")
+        return trades_df
 
-    for r in results:
-        all_trades.extend(r)
+    # Enforce dtypes
+    trades_df = trades_df.astype(
+        {
+            "blocktime": "datetime64[ns, UTC]",
+            "trader_id": "string",
+            "token_sold_mint": "string",
+            "amount_sold": "float64",
+            "token_bought_mint": "string",
+            "amount_bought": "float64",
+            "source_token": "string",
+            "signature": "string"
+        },
+        errors="ignore"
+    )
 
-    # Save cache
-    save_trade_cache(trade_cache)
+    # Attach current prices
+    unique_mints = trades_df["source_token"].dropna().unique().tolist()
+    current_prices = {}
+    for mint in unique_mints:
+        current_prices[mint] = await get_token_current_price(client, mint)
 
-    if not all_trades:
-        logger.warning("No trades found for given token mints.")
-        return pd.DataFrame()
+    trades_df["current_price"] = trades_df["source_token"].map(current_prices)
 
-    # Normalize data
-    df = pd.json_normalize(all_trades)
-
-    if "blockTime" in df.columns:
-        df["blocktime"] = pd.to_datetime(df["blockTime"], unit="s", utc=True)
-
-    rename_map = {
-        "tokenIn": "token_sold_mint",
-        "tokenOut": "token_bought_mint",
-        "amountIn": "amount_sold",
-        "amountOut": "amount_bought"
-    }
-    df.rename(columns=rename_map, inplace=True)
-
-    for col in ["amount_sold", "amount_bought"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    logger.info(f"✅ Fetched {len(df)} total trades for {len(token_mints)} token(s).")
-    return df
-
+    logger.info(f"✅ Flattened {len(trades_df)} swap trades for {len(valid_mints)} token(s).")
+    return trades_df
 
 # === Enrich with historical prices ===
 async def get_trades_with_prices(
@@ -667,74 +721,6 @@ async def get_trades_with_prices(
                            (trades_df["token_sold_mint"] == token)), "price"] = price_data
 
     logger.info(f"Applied historical prices (with caching) to {len(trades_df)} trades.")
-    return trades_df
-
-    # Helper to find price closest to timestamp
-    def get_price_at_timestamp(price_dict: Dict[int, float], timestamp: int) -> float:
-        if not price_dict:
-            return 0.0
-        closest_ts = max((ts for ts in price_dict.keys() if ts <= timestamp), default=None)
-        return price_dict.get(closest_ts, 0.0) if closest_ts else 0.0
-
-    # Apply historical prices
-    def apply_price_to_trade(row):
-        trade_timestamp = int(row["blocktime"].timestamp())
-        
-        # BUY: using SOL to buy token
-        if row["token_sold_mint"] == WSOL_MINT:
-            token_mint = row["token_bought_mint"]
-            price = get_price_at_timestamp(historical_prices_map.get(token_mint, {}), trade_timestamp)
-            sol_price = get_price_at_timestamp(historical_prices_map.get(WSOL_MINT, {}), trade_timestamp)
-            row["price"] = price
-            row["amount_usd"] = row["amount_sold"] * (sol_price or 1.0)
-        
-        # SELL: selling token for SOL
-        elif row["token_bought_mint"] == WSOL_MINT:
-            token_mint = row["token_sold_mint"]
-            price = get_price_at_timestamp(historical_prices_map.get(token_mint, {}), trade_timestamp)
-            sol_price = get_price_at_timestamp(historical_prices_map.get(WSOL_MINT, {}), trade_timestamp)
-            row["price"] = price
-            row["amount_usd"] = row["amount_bought"] * (sol_price or 1.0)
-        
-        else:
-            # Token-to-token swap
-            row["price"] = 0.0
-            row["amount_usd"] = 0.0
-        
-        return row
-
-    trades_df = trades_df.apply(apply_price_to_trade, axis=1)
-
-    # Fallback: fetch current prices for tokens with missing historical data
-    missing_price_mask = trades_df["price"] == 0.0
-    if missing_price_mask.any():
-        missing_tokens = trades_df[missing_price_mask].apply(
-            lambda r: r["token_bought_mint"] if r["token_sold_mint"] == WSOL_MINT else r["token_sold_mint"],
-            axis=1
-        ).unique().tolist()
-        
-        current_prices = {}
-        for mint in missing_tokens + [WSOL_MINT]:
-            current_prices[mint] = await get_token_current_price(client, mint)
-        
-        def apply_fallback_price(row):
-            if row["price"] == 0.0:
-                token_mint = (
-                    row["token_bought_mint"]
-                    if row["token_sold_mint"] == WSOL_MINT
-                    else row["token_sold_mint"]
-                )
-                row["price"] = current_prices.get(token_mint, 0.0)
-                sol_price = current_prices.get(WSOL_MINT, 0.0)
-                if row["token_sold_mint"] == WSOL_MINT:
-                    row["amount_usd"] = row["amount_sold"] * sol_price
-                elif row["token_bought_mint"] == WSOL_MINT:
-                    row["amount_usd"] = row["amount_bought"] * sol_price
-            return row
-
-        trades_df = trades_df.apply(apply_fallback_price, axis=1)
-
-    logger.info(f"Applied prices (historical + fallback) to {len(trades_df)} trades")
     return trades_df
 
 # === FIXED Metrics (PNL, ROI) ===
