@@ -208,10 +208,10 @@ def main():
     
     # === Analysis Parameters ===
     st.sidebar.subheader("⚙️ Parameters")
-    trade_limit = st.sidebar.slider("Trade Limit", min_value=50, max_value=500, value=100, step=50)
+    trade_limit = st.sidebar.slider("Trade Limit", min_value=50, max_value=500, value=50, step=20)
     
     # === API Limitations Notice ===
-    st.sidebar.info("ℹ️ Trade Limit helps the app to run better, the smaller the limit the faster it would run, it get most recent transactions and goes in bacthes to past. Preferable to use small limit to avoid API limit rate")
+    st.sidebar.info("ℹ️ Trade Limit helps the app to run better, the larger the limit the faster it would run, it get most recent transactions and goes in batches to past. Preferable to use small limit to avoid API limit rate")
     
     # === Run Analysis Button ===
     if st.sidebar.button("🚀 Run Analysis", type="primary"):
@@ -787,5 +787,5 @@ if __name__ == "__main__":
         - **Trader Portfolio Analysis**: Analyze portfolios of traders who trade your tokens
         - **Wallet Analysis**: Deep dive into specific wallet performance
         
-        **Note**Please do not over use this service, it is just a test, the API compute unit could exhaust!!!
+        **Note:** Please do not over use this service, it is just a test, the API compute unit could exhaust!!!
         """)
