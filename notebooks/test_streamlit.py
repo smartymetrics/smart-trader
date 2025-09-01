@@ -136,7 +136,7 @@ def process_trader_metrics(results):
 
         trader_summary.append({
             # 'Trader ID': truncate_address(trader_id),
-            'Trader ID': trader_id,
+            'Trader ID': truncate_address(trader_id),
             'Total Buy Volume': total_buy_volume,
             'Total Sell Volume': total_sell_volume,
             'Realized PnL': total_realized_pnl,
